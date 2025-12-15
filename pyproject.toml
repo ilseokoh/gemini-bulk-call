@@ -1,0 +1,19 @@
+[project]
+name = "gemini-bulk-call"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "flask==3.0.3",
+    "google-cloud-aiplatform==1.130.0",
+    "google-cloud-bigquery==3.38.0",
+    "google-cloud-pubsub==2.33.0",
+    "google-cloud-storage==3.7.0",
+    "google-genai==1.55.0",
+    "gunicorn==23.0.0",
+    "pandas-gbq==0.31.1",
+    "pydantic==2.12.5",
+    "python-dotenv==1.2.1",
+    "werkzeug==3.0.3",
+]

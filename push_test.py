@@ -1,8 +1,17 @@
+import os
 import json
 from google.cloud import bigquery
 from google.cloud import pubsub_v1
+from dotenv import load_dotenv
 
-project_id = ""
+load_dotenv()
+
+project_id = os.environ.get('PROJECT_ID', '')
+pubsub_topic_name = os.environ.get('PUBSUB_TOPIC_NAME','')
+
+print("-----")
+print(project_id)
+
 
 def process_and_publish_csv_status():
     """
@@ -12,17 +21,17 @@ def process_and_publish_csv_status():
     Returns:
         int: The number of successfully processed and updated rows.
     """
-    topic_id = "midata_topic"
+    
     
     # Initialize Clients
     publisher = pubsub_v1.PublisherClient()
     bq_client = bigquery.Client(project=project_id)
     
-    topic_path = publisher.topic_path(project_id, topic_id)
+    topic_path = publisher.topic_path(project_id, pubsub_topic_name)
 
     # 1. Select Query
     sql = f"""
-    SELECT uri, content_type
+    SELECT uri, content_type, size
     FROM `{project_id}.csv_parse_ds.csv_analysis_status`
     WHERE status IS NULL
     LIMIT 10

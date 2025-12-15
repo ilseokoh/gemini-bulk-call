@@ -1,24 +1,14 @@
-# Copyright 2019 Google, LLC.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#    http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
-# [START cloudrun_pubsub_server]
 import os
 import time
 import random
 import json
 from flask import Flask, request, jsonify
 import base64
+from dotenv import load_dotenv
+import itertools
+
+from pydantic import BaseModel, Field
+from typing import Optional, List
 
 # Vertex AI SDK for Python
 from google import genai
@@ -34,9 +24,9 @@ from google.genai.types import (
     Tool,
     ToolCodeExecution,
 )
-from google.cloud import bigquery
+from google.cloud import bigquery, storage
 
-
+load_dotenv()
 app = Flask(__name__)
 
 # [END cloudrun_pubsub_server]
@@ -48,8 +38,30 @@ gemini_model = os.environ.get('GEMINI_MODEL','')
 pubsub_topic_name = os.environ.get('PUBSUB_TOPIC_NAME','')
 bq_location = os.environ.get('BQ_LOCATION','')
 
+# Define the size threshold (50MB in bytes)
+BIG_FILE_THRESHOLD = 50 * 1024 * 1024 - 10
+BIG_FILE_SKIP_THRESHOLD = 25 * 1024 * 1024 *1024
+
 # --- Initialize Vertex AI ---
 client = genai.Client(vertexai=True, project=project_id, location=gemini_location)
+
+class PIData(BaseModel):
+    """Extracted Personal Information Data Model"""
+    name: Optional[str] = Field(default=None, description="personal name")
+    gender: Optional[str] = Field(default=None, description="gender(Man or Woman)")
+    birthday: Optional[str] = Field(default=None, description="YYYY-MM-DD")
+    credit_card_no: Optional[str] = Field(default=None, description="credit card number")
+    phone_number: Optional[str] = Field(default=None, description="personal phone number")
+    address: Optional[str] = Field(default=None, description="full address")
+    passport_number: Optional[str] = Field(default=None, description="passport number")
+    social_security_number: Optional[str] = Field(default=None, description="social security number")
+    drivers_licence_number: Optional[str] = Field(default=None, description="drivers licence number")
+    is_sensitive_document: Optional[bool] = Field(
+        default=None,
+        description="if given document is `medical records` or `family relationship certificates` or `documents containing salary information` or identification information like `passport`, `driving license`, etc. then `true` else `false`"
+    )
+    email: Optional[str] = Field(default=None, description="email address")
+    others: Optional[str] = Field(default=None, description="other information")
 
 # instruction, sturctured ouput schema and prompt
 system_instruction = """
@@ -77,7 +89,7 @@ If there is no personal information in the given document or image, output shoul
  - email: email address
  - others: other information
 """
-prompt = "Please extract the personal information for the attached files."
+prompt = "Please extract the personal information."
 response_schema = {
     "type": "array",
   "items": {
@@ -123,6 +135,54 @@ response_schema = {
   }
 }
 
+def big_file_process(url: str, content_type: str) -> str:
+    """
+    Processes large text files from GCS by streaming and chunking.
+
+    Args:
+        url: The Google Cloud Storage URI of the file (e.g., "gs://bucket/file.csv").
+        content_type: The MIME type of the file.
+
+    Returns:
+        A JSON string representing the aggregated list of extracted PI data.
+
+    Raises:
+        ValueError: If the content_type is not 'text/csv' or URL is invalid.
+        Exception: For GCS or other processing errors.
+    """
+    if not url.startswith("gs://"):
+        raise ValueError("URL must start with 'gs://'")
+    if content_type != 'text/csv':
+        raise ValueError("Content type must be 'text/csv' for big file processing.")
+
+    storage_client = storage.Client(project=project_id)
+    bucket_name, blob_name = url.replace("gs://", "").split("/", 1)
+    bucket = storage_client.bucket(bucket_name)
+    blob = bucket.blob(blob_name)
+
+    result_pi_data = []
+    
+    print(f"--- Starting big file processing for {url} ---")
+    with blob.open("r", encoding="utf-8") as f:
+        while True:
+            # Read 5000 lines at a time
+            chunk_lines = list(itertools.islice(f, 5000))
+            if not chunk_lines:
+                break
+            
+            chunk_content = "".join(chunk_lines)
+            #print(f"Processing a chunk of {len(chunk_lines)} lines...")
+            
+            # Call Gemini for the chunk
+            pi_data_list_chunk = call_gemini_str(content=chunk_content)
+            if pi_data_list_chunk:
+                result_pi_data.extend(pi_data_list_chunk)
+            del chunk_lines, chunk_content
+
+    # Convert the list of Pydantic objects to a JSON string
+    json_compatible_list = [item.model_dump(exclude_none=True) for item in result_pi_data]
+    return json.dumps(json_compatible_list, ensure_ascii=False)
+
 def call_gemini(url: str, type: str):
     """
     Calls the Gemini model with a given file URI and includes retry logic
@@ -166,8 +226,6 @@ def call_gemini(url: str, type: str):
             if not result or not result.strip():
                 result = "[]"
 
-            print(f"gemini result : {result}")
-
             return result
         except Exception as e:
             print(f"Error on attempt {attempt + 1}: {e}")
@@ -179,6 +237,50 @@ def call_gemini(url: str, type: str):
             else:
                 print("Max retries reached. Failed to call Gemini API.")
                 raise # Re-raise the last exception
+
+def call_gemini_str(content: str) -> List[PIData]:
+    """
+    Calls the Gemini model with a given string content.
+
+    Args:
+        content: The string content to be analyzed.
+
+    Returns:
+        A list of PIData objects if successful, otherwise an empty list.
+    """
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            # Generate content
+            response = client.models.generate_content(
+                model=gemini_model,
+                contents=[f"{prompt}\n\n{content}"], # Combine prompt and content
+                config=GenerateContentConfig(
+                    system_instruction=system_instruction,
+                    response_mime_type="application/json",
+                    response_schema=response_schema,
+                ),
+            )
+
+            result_text = response.text
+
+            if not result_text or not result_text.strip():
+                return []
+
+            # Parse the JSON string and create a list of PIData objects
+            result_json = json.loads(result_text)
+            return [PIData(**item) for item in result_json]
+
+        except Exception as e:
+            print(f"Error on attempt {attempt + 1} in call_gemini_str: {e}")
+            if attempt < max_retries - 1:
+                # Exponential backoff: 2^attempt + random seconds
+                wait_time = (2 ** attempt) + random.uniform(0, 1)
+                print(f"Retrying in {wait_time:.2f} seconds...")
+                time.sleep(wait_time)
+            else:
+                print("Max retries reached. Failed to call Gemini API with string content.")
+                return [] # Return empty list after all retries fail
 
 def update_analysis_status(uri: str, status: str, result: str = None):
     """
@@ -237,12 +339,9 @@ def index():
     if not envelope:
         msg = "no JSON message received"
         print(f"error: {msg}")
-        return f"Bad Request: {msg}", 400
+        return f"Bad Request: {msg}", 204
 
     pubsub_message = envelope["message"]
-
-    print(pubsub_message)
-
 
     message_data = ""
     if "data" in pubsub_message:
@@ -253,28 +352,39 @@ def index():
     else:
         message_data = ""
 
-    print(f"Received message: {message_data}")
-
     if not message_data:
-        return f"Bad Request: {message_data}", 400
+        return f"Bad Request: {message_data}", 204
 
     requested_msg = json.loads(message_data)
 
     # 2. 필수 파라미터 추출 (url, content_type)
     url = requested_msg.get("uri")
     content_type = requested_msg.get("content_type")
+    file_size = requested_msg.get("size")
 
-    if not url or not content_type:
-        msg = "Missing 'url' or 'content_type' in the request."
+    if not all([url, content_type, file_size is not None]):
+        msg = "Missing 'uri', 'content_type', or 'size' in the request."
         print(f"error: {msg}")
-        return f"Bad Request: {msg}", 400
+        return f"Bad Request: {msg}", 204
 
     # 3. Gemini 호출 및 예외 처리
     try:
-        print(f"-------Processing request for URL: {url}, Content-Type: {content_type}")
-        
-        # call_gemini 함수 호출 (파라미터 전달)
-        gemini_response_text = call_gemini(url=url, type=content_type)
+        print(f"-------Processing request for URL: {url}, Size: {file_size} bytes")
+
+        # # Check if file size exceeds SKIP threshold
+        # if file_size > BIG_FILE_SKIP_THRESHOLD:
+        #     print(f"File size {file_size} exceeds skip threshold {BIG_FILE_SKIP_THRESHOLD}. Skipping.")
+        #     update_analysis_status(uri=url, status='skipped', result=None)
+        #     # Return 200 to acknowledge message and stop processing
+        #     return jsonify({"status": "skipped", "reason": "file too large"}), 200
+
+        gemini_response_text = ""
+        # If file size is over the threshold and it's a CSV, use the big file processor
+        if file_size > BIG_FILE_THRESHOLD and content_type == 'text/csv':
+            gemini_response_text = big_file_process(url=url, content_type=content_type)
+        else:
+            # For smaller files or other content types, use the standard call
+            gemini_response_text = call_gemini(url=url, type=content_type)
         
         # Gemini 응답(JSON String)을 파이썬 객체로 변환
         response_data = json.loads(gemini_response_text)
@@ -301,7 +411,7 @@ def index():
                 print(f"Failed to update status to failed in BigQuery: {e}")
 
 
-        return f"Bad Request: {ve}", 400
+        return f"Bad Request: {ve}", 204
         
     except Exception as e:
         # Gemini API 호출 실패 등 서버 내부 오류 처리 (500 Internal Server Error)
@@ -315,25 +425,4 @@ def index():
             except Exception as db_e:
                 print(f"Failed to update status to failed in BigQuery: {db_e}")
                 
-        return f"Internal Server Error: {e}", 500
-
-    # { "url": "gs://bucket/file.csv", "content_type": "text/csv"} 형식의 envelope 
-    # url 과 content_type 을 
-
-    # if not isinstance(envelope, dict) or "message" not in envelope:
-    #     msg = "invalid Pub/Sub message format"
-    #     print(f"error: {msg}")
-    #     return f"Bad Request: {msg}", 400
-
-    # pubsub_message = envelope["message"]
-
-    # name = "World"
-    # if isinstance(pubsub_message, dict) and "data" in pubsub_message:
-    #     name = base64.b64decode(pubsub_message["data"]).decode("utf-8").strip()
-
-    # print(f"Hello {name}!")
-
-    #return ("", 204)
-
-
-# [END cloudrun_pubsub_handler]
+        return f"Internal Server Error: {e}", 204

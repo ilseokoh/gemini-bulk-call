@@ -7,3 +7,5 @@ google-cloud-bigquery==3.38.0
 google-cloud-pubsub==2.33.0
 google-cloud-aiplatform==1.130.0
 python-dotenv==1.2.1
+pydantic==2.12.5
+google-cloud-storage==3.7.0
