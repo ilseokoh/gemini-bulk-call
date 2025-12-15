@@ -9,3 +9,4 @@ google-cloud-aiplatform==1.130.0
 python-dotenv==1.2.1
 pydantic==2.12.5
 google-cloud-storage==3.7.0
+chardet==5.2.0

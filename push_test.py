@@ -34,7 +34,7 @@ def process_and_publish_csv_status():
     SELECT uri, content_type, size
     FROM `{project_id}.csv_parse_ds.csv_analysis_status`
     WHERE status IS NULL
-    LIMIT 10
+    LIMIT 1
     """
 
     try:

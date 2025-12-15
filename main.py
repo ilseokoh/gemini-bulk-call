@@ -25,6 +25,7 @@ from google.genai.types import (
     ToolCodeExecution,
 )
 from google.cloud import bigquery, storage
+import chardet
 
 load_dotenv()
 app = Flask(__name__)
@@ -40,7 +41,7 @@ bq_location = os.environ.get('BQ_LOCATION','')
 
 # Define the size threshold (50MB in bytes)
 BIG_FILE_THRESHOLD = 50 * 1024 * 1024 - 10
-BIG_FILE_SKIP_THRESHOLD = 25 * 1024 * 1024 *1024
+BIG_FILE_SKIP_THRESHOLD = 50 * 1024 * 1024 *1024 -100
 
 # --- Initialize Vertex AI ---
 client = genai.Client(vertexai=True, project=project_id, location=gemini_location)
@@ -183,6 +184,64 @@ def big_file_process(url: str, content_type: str) -> str:
     json_compatible_list = [item.model_dump(exclude_none=True) for item in result_pi_data]
     return json.dumps(json_compatible_list, ensure_ascii=False)
 
+
+def convert_gcs_encoding_to_utf8_cwd(gcs_uri: str, src_encoding: str):
+    """
+    GCS 파일을 현재 디렉토리로 다운로드하여 지정된 인코딩(src_encoding)을
+    UTF-8로 변환한 뒤, GCS에 덮어쓰고 로컬 파일은 삭제합니다.
+
+    Args:
+        gcs_uri (str): gs://bucket-name/path/to/file 형식의 URI
+        src_encoding (str): 원본 파일의 인코딩 (예: 'euc-kr', 'cp949', 'utf-16')
+    """
+    if not gcs_uri.startswith("gs://"):
+        raise ValueError("URI must start with 'gs://'")
+
+    # 1. URI 파싱 및 클라이언트 설정
+    parts = gcs_uri[5:].split("/", 1)
+    bucket_name = parts[0]
+    blob_name = parts[1]
+    
+    # 파일명 추출 및 로컬 경로 설정
+    filename = os.path.basename(blob_name)
+    local_input_path = filename
+    local_output_path = f"utf8_{filename}"
+
+    client = storage.Client()
+    bucket = client.bucket(bucket_name)
+    blob = bucket.blob(blob_name)
+
+    try:
+        # 2. 현재 디렉토리로 다운로드
+        blob.download_to_filename(local_input_path)
+
+        # 3. 인코딩 변환 (src_encoding -> utf-8)
+        with open(local_input_path, "r", encoding=src_encoding) as f_in:
+            with open(local_output_path, "w", encoding="utf-8") as f_out:
+                for line in f_in:
+                    f_out.write(line)
+
+        # 4. GCS에 업로드 (덮어쓰기)
+        blob.upload_from_filename(
+            local_output_path,
+            content_type=blob.content_type  # 기존 Content-Type 유지
+        )
+        print(f"Successfully converted and uploaded. {gcs_uri} ")
+
+    except UnicodeDecodeError:
+        print(f"Error: '{src_encoding}' 인코딩으로 파일을 읽을 수 없습니다. 인코딩을 확인해주세요.")
+    except Exception as e:
+        print(f"An error occurred: {e}")
+        
+    finally:
+        # 5. 로컬 파일 정리
+        if os.path.exists(local_input_path):
+            os.remove(local_input_path)
+            
+        if os.path.exists(local_output_path):
+            os.remove(local_output_path)
+            print("Cleanup complete.")
+
 def call_gemini(url: str, type: str):
     """
     Calls the Gemini model with a given file URI and includes retry logic
@@ -202,12 +261,18 @@ def call_gemini(url: str, type: str):
     if not url.startswith("gs://"):
         raise ValueError("URL must start with 'gs://'")
 
-    csv_file = Part.from_uri(
-            file_uri=url,
-            mime_type=type,
-        )
+    encoding = detect_gcs_encoding(url)
 
-    max_retries = 6
+    if encoding:
+        if encoding.lower() == 'utf-8':
+            pass
+        elif encoding.lower() == 'utf-16' or encoding.lower() == 'euc-kr':
+            convert_gcs_encoding_to_utf8_cwd(url, encoding.lower())
+        else:
+            convert_gcs_encoding_to_utf8_cwd(url, encoding.lower())
+
+    csv_file = Part.from_uri(file_uri=url, mime_type="text/csv")
+    max_retries = 3
     for attempt in range(max_retries):
         try:
             # Generate content
@@ -229,6 +294,11 @@ def call_gemini(url: str, type: str):
             return result
         except Exception as e:
             print(f"Error on attempt {attempt + 1}: {e}")
+
+            error_str = str(e)
+            if "400" in error_str and "INVALID_ARGUMENT" in error_str:
+                attempt = max_retries
+
             if attempt < max_retries - 1:
                 # Exponential backoff: 2^attempt + random seconds
                 wait_time = (2 ** attempt) + random.uniform(0, 1)
@@ -301,13 +371,9 @@ def update_analysis_status(uri: str, status: str, result: str = None):
     
     # 2. UPDATE 쿼리 작성 (updated 컬럼은 현재 시간으로 자동 갱신)
     query = f"""
-        UPDATE `{project_id}.csv_parse_ds.csv_analysis_status`
-        SET 
-            status = @status,
-            result = @result,
-            updated = CURRENT_TIMESTAMP()
-        WHERE uri = @uri
-    """
+        INSERT INTO `{project_id}.csv_parse_ds.csv_analysis_status_result` (uri, status, result)
+        VALUES (@uri, @status, @result)
+        """
     
     # 3. 쿼리 파라미터 설정 (SQL Injection 방지 및 타입 안전성)
     job_config = bigquery.QueryJobConfig(
@@ -327,6 +393,51 @@ def update_analysis_status(uri: str, status: str, result: str = None):
     except Exception as e:
         print(f"Failed to update BigQuery status: {e}")
         raise
+
+def detect_gcs_encoding(gcs_uri: str, chunk_size: int = 1024) -> str:
+    """
+    GCS 파일을 스트리밍으로 열어 초반 1024바이트(chunk_size)만 읽은 뒤
+    파일의 인코딩 방식을 감지하여 반환합니다.
+
+    Args:
+        gcs_uri (str): gs://bucket-name/path/to/file 형식의 URI
+        chunk_size (int): 읽어올 바이트 수 (기본 1024)
+
+    Returns:
+        str: 감지된 인코딩 이름 (예: 'utf-8', 'EUC-KR', 'ascii'). 
+             감지 실패 시 None 반환.
+    """
+    if not gcs_uri.startswith("gs://"):
+        raise ValueError("URI must start with 'gs://'")
+
+    # 1. URI 파싱
+    parts = gcs_uri[5:].split("/", 1)
+    bucket_name = parts[0]
+    blob_name = parts[1]
+
+    try:
+        # 2. GCS 클라이언트 및 Blob 초기화
+        storage_client = storage.Client()
+        bucket = storage_client.bucket(bucket_name)
+        blob = bucket.blob(blob_name)
+
+        # 3. 스트리밍으로 열어서 지정된 바이트(1024)만큼만 읽기
+        # 'rb' 모드로 열어야 바이너리 데이터를 읽을 수 있습니다.
+        with blob.open("rb") as f:
+            raw_data = f.read(chunk_size)
+
+        # 4. 인코딩 감지
+        result = chardet.detect(raw_data)
+        encoding = result['encoding']
+        confidence = result['confidence']
+
+        print(f"Detected: {encoding} (Confidence: {confidence})")
+        
+        return encoding
+
+    except Exception as e:
+        print(f"Error detecting encoding: {e}")
+        return None
 
 # [START cloudrun_pubsub_handler]
 @app.route("/", methods=["POST"])
@@ -372,11 +483,11 @@ def index():
         print(f"-------Processing request for URL: {url}, Size: {file_size} bytes")
 
         # # Check if file size exceeds SKIP threshold
-        # if file_size > BIG_FILE_SKIP_THRESHOLD:
-        #     print(f"File size {file_size} exceeds skip threshold {BIG_FILE_SKIP_THRESHOLD}. Skipping.")
-        #     update_analysis_status(uri=url, status='skipped', result=None)
-        #     # Return 200 to acknowledge message and stop processing
-        #     return jsonify({"status": "skipped", "reason": "file too large"}), 200
+        if file_size > BIG_FILE_SKIP_THRESHOLD:
+            print(f"File size {file_size} exceeds skip threshold {BIG_FILE_SKIP_THRESHOLD}. Skipping.")
+            update_analysis_status(uri=url, status='skipped', result=None)
+            # Return 200 to acknowledge message and stop processing
+            return jsonify({"status": "skipped", "reason": "file too large"}), 200
 
         gemini_response_text = ""
         # If file size is over the threshold and it's a CSV, use the big file processor

@@ -5,6 +5,7 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "chardet==5.2.0",
     "flask==3.0.3",
     "google-cloud-aiplatform==1.130.0",
     "google-cloud-bigquery==3.38.0",
