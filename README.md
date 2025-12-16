@@ -3,6 +3,10 @@
 BigQuery + pub/sub + Cloud Run 
 This sample shows how to create a service that call the gemini for the bulk files. 
 
+## Architecture
+
+![Architecture diagram](img/architecture.jpg)
+
 ## Create Pub/Sub, Artifact Repo,  
 
 Create Artifacts Repository
@@ -49,8 +53,8 @@ gcloud auth configure-docker asia-northeast3-docker.pkg.dev
 Build Image
 ```
 docker build -t gemini-analysis-pubsub:v9 .
-docker tag gemini-analysis-pubsub:v9 asia-northeast3-docker.pkg.dev/kevin-ai-playground/bulk-data-repo/gemini-analysis-pubsub:v9
-docker push asia-northeast3-docker.pkg.dev/kevin-ai-playground/bulk-data-repo/gemini-analysis-pubsub:v9
+docker tag gemini-analysis-pubsub:v9 asia-northeast3-docker.pkg.dev/{project-id}/bulk-data-repo/gemini-analysis-pubsub:v9
+docker push asia-northeast3-docker.pkg.dev/{project-id}/bulk-data-repo/gemini-analysis-pubsub:v9
 ```
 
 ## Deploy to Cloud Run
@@ -63,7 +67,7 @@ gcloud config set project PROJECT_ID
 
 Deploy to Cloud Run with VCP egress
 ```
-gcloud run deploy gemini-analysis-pubsub --image asia-northeast3-docker.pkg.dev/kevin-ai-playground/bulk-data-repo/gemini-analysis-pubsub:v9   --no-allow-unauthenticated  --project kevin-ai-playground  --region=asia-northeast3 --env-vars-file=.env --vpc-egress=all-traffic --network-tags=bulkdata-run --network=kevin-vpc --subnet=kevin-vpc --memory 32Gi
+gcloud run deploy gemini-analysis-pubsub --image asia-northeast3-docker.pkg.dev/{project-id}/bulk-data-repo/gemini-analysis-pubsub:v9   --no-allow-unauthenticated  --project {project-id}  --region=asia-northeast3 --env-vars-file=.env --vpc-egress=all-traffic --network-tags=bulkdata-run --network={vpc-name} --subnet={subnet-name} --memory 8Gi --cpu 4
 ```
 
 The result looks like this: 
@@ -107,34 +111,10 @@ gcloud projects add-iam-policy-binding {PROJECT_NUMBER} \
 
 ## Log 
 
+Cloud Logging Query
+```
 resource.type="cloud_run_revision"
-resource.labels.revision_name="gemini-analysis-pubsub-00002-8dd"
+resource.labels.revision_name="gemini-analysis-pubsub-00002-xxx"
 resource.labels.service_name="gemini-analysis-pubsub"
+```
 
-
-pjt-lges-midata
-
-gcloud pubsub subscriptions create cloud-run-sub2 --topic midata_topic \
---ack-deadline=600 \
---push-endpoint=https://gemini-analysis-pubsub-776425238788.asia-northeast3.run.app \
---push-auth-service-account=cloud-run-pubsub-invoker@pjt-lges-midata.iam.gserviceaccount.com
-
-gcloud auth configure-docker asia-northeast3-docker.pkg.dev
-
-docker build -t gemini-analysis-pubsub:v11 .
-docker tag gemini-analysis-pubsub:v11 asia-northeast3-docker.pkg.dev/pjt-lges-midata/midata-repo/gemini-analysis-pubsub:v11
-docker push asia-northeast3-docker.pkg.dev/pjt-lges-midata/midata-repo/gemini-analysis-pubsub:v11
-
-gcloud run deploy gemini-analysis-pubsub --no-allow-unauthenticated  --project pjt-lges-midata  --region=asia-northeast3 --env-vars-file=.env --vpc-egress=all-traffic --network-tags=bulkdata-run --network=vpc-an3-temp-cloud-run --subnet=sbn-an3-midata-temp --memory 8Gi --cpu 4 --image asia-northeast3-docker.pkg.dev/pjt-lges-midata/midata-repo/gemini-analysis-pubsub:v11
-
-gcloud pubsub subscriptions pull midata_topic-sub --auto-ack
-
-
-gcloud run services add-iam-policy-binding gemini-analysis-pubsub \
---member=serviceAccount:cloud-run-pubsub-invoker@pjt-lges-midata.iam.gserviceaccount.com \
---role=roles/run.invoker
-
-
-gcloud pubsub subscriptions seek cloud-run-sub2 --time=$(date +%Y-%m-%dT%H:%M:%S%z)
-
-gcloud pubsub subscriptions seek midata_topic-sub --time=$(date +%Y-%m-%dT%H:%M:%S%z)
