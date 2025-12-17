@@ -36,12 +36,13 @@ app = Flask(__name__)
 project_id = os.environ.get('PROJECT_ID', '')
 gemini_location = os.environ.get('GEMINI_LOCATION', '')
 gemini_model = os.environ.get('GEMINI_MODEL','')
-pubsub_topic_name = os.environ.get('PUBSUB_TOPIC_NAME','')
 bq_location = os.environ.get('BQ_LOCATION','')
+bq_table = os.environ.get('BQ_TABLE_NAME','')
+
 
 # Define the size threshold (50MB in bytes)
 BIG_FILE_THRESHOLD = 50 * 1024 * 1024 - 10
-BIG_FILE_SKIP_THRESHOLD = 50 * 1024 * 1024 *1024 -100
+BIG_FILE_SKIP_THRESHOLD = 50 * 1024 * 1024 - 10
 
 # --- Initialize Vertex AI ---
 client = genai.Client(vertexai=True, project=project_id, location=gemini_location)
@@ -226,7 +227,6 @@ def convert_gcs_encoding_to_utf8_cwd(gcs_uri: str, src_encoding: str):
             local_output_path,
             content_type=blob.content_type  # 기존 Content-Type 유지
         )
-        print(f"Successfully converted and uploaded. {gcs_uri} ")
 
     except UnicodeDecodeError:
         print(f"Error: '{src_encoding}' 인코딩으로 파일을 읽을 수 없습니다. 인코딩을 확인해주세요.")
@@ -240,7 +240,6 @@ def convert_gcs_encoding_to_utf8_cwd(gcs_uri: str, src_encoding: str):
             
         if os.path.exists(local_output_path):
             os.remove(local_output_path)
-            print("Cleanup complete.")
 
 def call_gemini(url: str, type: str):
     """
@@ -271,7 +270,10 @@ def call_gemini(url: str, type: str):
         else:
             convert_gcs_encoding_to_utf8_cwd(url, encoding.lower())
 
+    print(f"-------Processing request for URL: {url}, type: {type}, encoding: {encoding}")
+
     csv_file = Part.from_uri(file_uri=url, mime_type="text/csv")
+    
     max_retries = 3
     for attempt in range(max_retries):
         try:
@@ -306,7 +308,7 @@ def call_gemini(url: str, type: str):
                 time.sleep(wait_time)
             else:
                 print("Max retries reached. Failed to call Gemini API.")
-                raise # Re-raise the last exception
+                return "", 200
 
 def call_gemini_str(content: str) -> List[PIData]:
     """
@@ -371,7 +373,7 @@ def update_analysis_status(uri: str, status: str, result: str = None):
     
     # 2. UPDATE 쿼리 작성 (updated 컬럼은 현재 시간으로 자동 갱신)
     query = f"""
-        INSERT INTO `{project_id}.csv_parse_ds.csv_analysis_status_result` (uri, status, result)
+        INSERT INTO `{project_id}.csv_parse_ds.{bq_table}` (uri, status, result)
         VALUES (@uri, @status, @result)
         """
     
@@ -392,7 +394,7 @@ def update_analysis_status(uri: str, status: str, result: str = None):
         
     except Exception as e:
         print(f"Failed to update BigQuery status: {e}")
-        raise
+        return "", 200
 
 def detect_gcs_encoding(gcs_uri: str, chunk_size: int = 1024) -> str:
     """
@@ -408,7 +410,7 @@ def detect_gcs_encoding(gcs_uri: str, chunk_size: int = 1024) -> str:
              감지 실패 시 None 반환.
     """
     if not gcs_uri.startswith("gs://"):
-        raise ValueError("URI must start with 'gs://'")
+        return "URI must start with 'gs://'", 200
 
     # 1. URI 파싱
     parts = gcs_uri[5:].split("/", 1)
@@ -430,14 +432,53 @@ def detect_gcs_encoding(gcs_uri: str, chunk_size: int = 1024) -> str:
         result = chardet.detect(raw_data)
         encoding = result['encoding']
         confidence = result['confidence']
-
-        print(f"Detected: {encoding} (Confidence: {confidence})")
         
         return encoding
 
     except Exception as e:
         print(f"Error detecting encoding: {e}")
         return None
+
+def check_uri_absence_in_bigquery(check_uri: str, project_id: str) -> bool:
+    """
+    {bq_table} 테이블에서 특정 URI의 개수를 확인하고,
+    개수가 0이면 True, 0 초과면 False를 반환하는 함수.
+
+    Args:
+        check_uri (str): 확인할 URI 값.
+        project_id (str): BigQuery 프로젝트 ID.
+
+    Returns:
+        bool: URI 개수가 0이면 True, 0 초과면 False.
+    """
+    client = bigquery.Client(project=project_id)
+    table_id = f"`csv_parse_ds.{bq_table}`"
+
+    # SQL 쿼리 정의
+    query = f"""
+    SELECT COUNT(uri) AS uri_count
+    FROM {table_id}
+    WHERE uri = '{check_uri}'
+    """
+
+    try:
+        query_job = client.query(query)  # API 요청
+        results = query_job.result()  # 결과 대기
+
+        for row in results:
+            uri_count = row.uri_count
+            break # 첫 번째 (이자 유일한) 행에서 count 값을 가져옴
+
+        if uri_count == 0:
+            return False
+        else:
+            return True
+
+    except Exception as e:
+        print(f"BigQuery 쿼리 실행 중 오류가 발생했습니다: {e}")
+        # 오류 발생 시 기본적으로 False를 반환하거나, 에러 처리를 원하는 방식으로 구현
+        return False
+
 
 # [START cloudrun_pubsub_handler]
 @app.route("/", methods=["POST"])
@@ -450,7 +491,8 @@ def index():
     if not envelope:
         msg = "no JSON message received"
         print(f"error: {msg}")
-        return f"Bad Request: {msg}", 204
+        update_analysis_status(uri=url, status='failed', result=None)
+        return f"Bad Request: {msg}", 200
 
     pubsub_message = envelope["message"]
 
@@ -464,7 +506,8 @@ def index():
         message_data = ""
 
     if not message_data:
-        return f"Bad Request: {message_data}", 204
+        update_analysis_status(uri=url, status='failed', result=None)
+        return f"Bad Request: {message_data}", 200
 
     requested_msg = json.loads(message_data)
 
@@ -476,22 +519,26 @@ def index():
     if not all([url, content_type, file_size is not None]):
         msg = "Missing 'uri', 'content_type', or 'size' in the request."
         print(f"error: {msg}")
+        update_analysis_status(uri=url, status='failed', result=None)
         return f"Bad Request: {msg}", 204
+
+    existed = check_uri_absence_in_bigquery(check_uri=url, project_id=project_id)
+    if existed == True:
+        print(f"xxxxxxxx skip: {url}")
+        return "", 200
 
     # 3. Gemini 호출 및 예외 처리
     try:
-        print(f"-------Processing request for URL: {url}, Size: {file_size} bytes")
-
         # # Check if file size exceeds SKIP threshold
         if file_size > BIG_FILE_SKIP_THRESHOLD:
-            print(f"File size {file_size} exceeds skip threshold {BIG_FILE_SKIP_THRESHOLD}. Skipping.")
+            print(f"_______File size {file_size} exceeds skip threshold {BIG_FILE_SKIP_THRESHOLD}. Skipping.")
             update_analysis_status(uri=url, status='skipped', result=None)
             # Return 200 to acknowledge message and stop processing
             return jsonify({"status": "skipped", "reason": "file too large"}), 200
 
         gemini_response_text = ""
         # If file size is over the threshold and it's a CSV, use the big file processor
-        if file_size > BIG_FILE_THRESHOLD and content_type == 'text/csv':
+        if file_size > BIG_FILE_THRESHOLD:
             gemini_response_text = big_file_process(url=url, content_type=content_type)
         else:
             # For smaller files or other content types, use the standard call
@@ -522,7 +569,7 @@ def index():
                 print(f"Failed to update status to failed in BigQuery: {e}")
 
 
-        return f"Bad Request: {ve}", 204
+        return f"Bad Request: {ve}", 200
         
     except Exception as e:
         # Gemini API 호출 실패 등 서버 내부 오류 처리 (500 Internal Server Error)
@@ -536,4 +583,4 @@ def index():
             except Exception as db_e:
                 print(f"Failed to update status to failed in BigQuery: {db_e}")
                 
-        return f"Internal Server Error: {e}", 204
+        return f"Internal Server Error: {e}", 200
